@@ -11,6 +11,7 @@ from hashlib import sha512
 import time
 from os import urandom
 from datetime import datetime, timedelta
+from dateutil import tz
 import xml.etree.ElementTree as ET
 import binascii
 import argparse
@@ -59,8 +60,6 @@ class Api():
       return Recipient(name, serial, (key['modulus'].native, key['public_exponent'].native), isca(tbs['extensions']))
 
     r = Api.carequest()
-    if not r.url.startswith('https://'):
-      print('Server does not enforce https!')
 
     if r.headers['Content-Type'] == 'application/x-x509-ca-ra-cert':
       certs = cms.ContentInfo.load(r.content)['content']['certificates']
@@ -157,7 +156,7 @@ class EnvelopedData():
   def toasn(self, enckey=None):
     pad = lambda s: s + (8 - len(s)%8)*bytes([8 - len(s)%8])
     iv = b'\x00'*8
-    deskey = b'A'*24
+    deskey = b'A'*8 + b'\x00'*8 + b'\x7f'*8
     des = DES3.new(deskey, DES3.MODE_CBC, iv)
     rsakey = RSA.construct(self.recipient.keyparams)
     rsa = PKCS1_v1_5.new(rsakey)
@@ -212,8 +211,8 @@ class SignedData():
             'signature': { 'algorithm': 'sha512_rsa' },
             'issuer': x509.Name.build({ 'common_name': 'pointless' }),
             'validity': {
-              'not_before': core.UTCTime(datetime.now()),
-              'not_after': core.UTCTime(datetime.now() + timedelta(days=1))
+              'not_before': core.UTCTime(datetime.now(tz=tz.UTC)),
+              'not_after': core.UTCTime(datetime.now(tz=tz.UTC) + timedelta(days=1))
             },
             'subject': x509.Name.build({ 'common_name': 'pointless' }),
             'subject_public_key_info': {
@@ -244,7 +243,7 @@ class SignedData():
       },
       {
         'type': 'signing_time',
-        'values': [ core.UTCTime(datetime.now()) ]
+        'values': [ core.UTCTime(datetime.now(tz=tz.UTC)) ]
       },
       {
         'type': '2.16.840.1.113733.1.9.5', # senderNonce
@@ -264,7 +263,7 @@ class SignedData():
 
     # servers dont seem to validate the self signed certificates signature, set it anyway
     sign['certificates'][0].chosen['signature_value'] = asymmetric.rsa_pkcs1v15_sign(askey, sign['certificates'][0].chosen['tbs_certificate'].dump(force=True), 'sha512')
-    # black magic where we need to sign attributes as set net a setof (\x31 instead of \xA0)
+    # black magic where we need to sign attributes as set instead of setof (\x31 instead of \xA0)
     sign['signer_infos'][0]['signature'] = asymmetric.rsa_pkcs1v15_sign(askey, b'\x31' + sign['signer_infos'][0]['signed_attrs'].dump(force=True)[1:], 'sha512')
     return cms.ContentInfo({
       'content_type': 'signed_data',
@@ -411,15 +410,86 @@ class TestSuite():
       if end-start == 1234:
         print('cert duration is user controlled')
 
+  def testoracle(self):
+    # valid sym key enrollstatement: -2146881269 failinfo: 2
+    # invalid length, well padded -2146893815 1
+    # valid length, well padded -2146893819 1
+    # invalid -2146893819 1
+    #
+    # there is a bleichenbacher oracle on the envelopeddata
+    # of MS NetworkDeviceEnrollmentService
+    for recipient in self.recipients:
+      #if not recipient.isca:
+      #  continue
+
+      rsa = RSA.construct(recipient.keyparams)
+      rsa = PKCS1_v1_5.new(rsa)
+      k = len(rsa.encrypt(b'A'))
+      wellformed = rsa.encrypt(b'C'*(k//2))
+      env = EnvelopedData(recipient, b'A'*200).toasn(enckey=wellformed).dump(force=True)
+      sign = SignedData(env).toasn().dump(force=True)
+      r1 = Api.certrequest(b64encode(sign))
+      if r1.status_code == 200:
+        signed = cms.ContentInfo.load(r1.content)['content']
+        v1 = enrollstatement(signed)
+      else:
+        v1 = None
+
+      illformed = bytes.fromhex(hex(pow(1234, recipient.keyparams[1], recipient.keyparams[0]))[2:].zfill(2*k))
+      env = EnvelopedData(recipient, b'A'*200).toasn(enckey=illformed).dump(force=True)
+      sign = SignedData(env).toasn().dump(force=True)
+      r2 = Api.certrequest(b64encode(sign))
+      if r2.status_code == 200:
+        signed = cms.ContentInfo.load(r2.content)['content']
+        v2 = enrollstatement(signed)
+      else:
+        v2 = None
+
+      success = v1 is not None and v2 is not None
+      if (success and v1 != v2) or (not success and r1.content != r2.content):
+        print('asymmetric padding oracle detected [CVE-2022-37959]')
+        break
+
+  def testsymoracle(self):
+    try:
+      ans = set()
+      for test in range(0, 256):
+        xml = b64decode(self.password.encode())
+        root = ET.fromstring(xml)
+        data = root.find('Data')
+        if data is None:
+          return
+        chall = data.find('CertEnrollChallenge')
+        if chall is None:
+          return
+        ci = cms.ContentInfo.load(b64decode(chall.text.encode()))
+        ec = ci['content']['encrypted_content_info']
+        enc = ec['encrypted_content'].native
+        ec['encrypted_content'] = enc[:-1] + bytes([test])
+        chall.text = b64encode(ci.dump(force=True)).decode()
+        password = b64encode(ET.tostring(root)).decode()
+        pay = self.buildpay(password=password)
+        r = Api.certrequest(b64encode(pay))
+        signed = cms.ContentInfo.load(r.content)['content']
+        if hasfailinfo(signed):
+          ans |= { enrollstatement(signed) }
+
+      if len(ans) > 1:
+        print('decryptable challenge password')
+    except (ET.ParseError, binascii.Error):
+      # this test does not apply for scep servers that
+      # use a shared secret as challengepassword
+      pass
+
   def test(self):
     def tryrequiredattr(recipient):
       # some servers require this attribute request
-      knownrequiredattrs = [[{
-        'extn_id': '2.5.29.15',
-        'critical': True,
-        'extn_value': x509.KeyUsage((1,)).dump(force=True)
-      }]]
-      for attr in [[]] + knownrequiredattrs:
+      #knownrequiredattrs = [[{
+      #  'extn_id': '2.5.29.15',
+      #  'critical': True,
+      #  'extn_value': x509.KeyUsage((1,)).dump(force=True)
+      #}]]
+      for attr in [[]]:# + knownrequiredattrs:
         cert = self.request(recipient, attrs=attr)
         if cert is not None:
           self.requiredattr = attr
@@ -441,8 +511,10 @@ class TestSuite():
       self.testcommonname()
       self.testduration()
       self.testattrs()
+      # self.testsymoracle()
 
     # add here tests that do not require a default cert
+    self.testoracle()
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
