@@ -352,7 +352,7 @@ class TestSuite():
       (
         'key usage',
         '2.5.29.15',
-        x509.KeyUsage((1,0,1,0,1,0,1)).dump(force=True)
+        x509.KeyUsage((1,0,1,0,1,0,1))
       ),
       (
         'subject alt name',
@@ -363,7 +363,7 @@ class TestSuite():
             'id': '1.3.6.1.4.1.311.20.2.3', # universalPrincipalName
             'name': [ core.UTF8String('1234') ]
           }
-        }).dump(force=True)
+        })
       )
 
       # EntrepriseOidRoot?, requested by intune but not added to the certificate
@@ -371,7 +371,7 @@ class TestSuite():
       #  '1.3.6.1.4.1.311.21.8',
       #  EntrepriseOidRoot({
       #    'inner': EntrepriseOidRootInner({ 'name': [ core.UTF8String('UtilisateurNDES') ] })
-      #  }).dump(force=True)
+      #  })
       #)
     ]
 
@@ -487,7 +487,7 @@ class TestSuite():
       #knownrequiredattrs = [[{
       #  'extn_id': '2.5.29.15',
       #  'critical': True,
-      #  'extn_value': x509.KeyUsage((1,)).dump(force=True)
+      #  'extn_value': x509.KeyUsage((1,))
       #}]]
       for attr in [[]]:# + knownrequiredattrs:
         cert = self.request(recipient, attrs=attr)
